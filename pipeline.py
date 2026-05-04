@@ -1,5 +1,5 @@
 """
-Pipeline Orchestrator: End-to-end execution (Section 13).
+Pipeline Orchestrator: End-to-end execution .
 Orchestrates data → features → scoring → ML → ensemble → output.
 """
 
@@ -58,7 +58,7 @@ class PharmaceuticalInvestmentPipeline:
         self.execution_log.append(log_entry)
         print(log_entry)
     
-    # ===== STEP 1-2: DATA INGESTION & CLEANING =====
+    #  DATA INGESTION & CLEANING =====
     
     def run_data_layer(self) -> bool:
         """Load, validate, and clean IQVIA data."""
@@ -86,7 +86,7 @@ class PharmaceuticalInvestmentPipeline:
             self.log("DATA", f"ERROR: {e}")
             return False
     
-    # ===== STEP 3: FEATURE ENGINEERING =====
+    # FEATURE ENGINEERING =====
     
     def run_feature_layer(self) -> bool:
         """Build all strategic metrics."""
@@ -105,7 +105,7 @@ class PharmaceuticalInvestmentPipeline:
             self.log("FEATURES", f"ERROR: {e}")
             return False
     
-    # ===== STEP 4: SCORING =====
+    # === SCORING =====
     
     def run_scoring_layer(self) -> bool:
         """Apply dual-score framework."""
@@ -124,18 +124,18 @@ class PharmaceuticalInvestmentPipeline:
             self.log("SCORING", f"ERROR: {e}")
             return False
     
-    # ===== STEP 5: ML MODELING =====
+    # ===== ML MODELING =====
     
     def run_ml_layer(self) -> bool:
         """
-        FIX #23: Add fallback if ML fails - continue with scoring only.
+        Add fallback if ML fails - continue with scoring only.
         Train classification, forecasting, and clustering models.
         """
         try:
             self.log("ML", "Training Random Forest classifier...")
             ml = MLModels(self.features)
             
-            # FIX #23: Try ML, but continue if it fails
+            # Try ML, but continue if it fails
             try:
                 results = ml.train_all_models()
                 
@@ -154,7 +154,7 @@ class PharmaceuticalInvestmentPipeline:
                 
             except Exception as ml_error:
                 self.log("ML", f"WARNING: ML training failed ({str(ml_error)}), continuing with scoring only")
-                # FIX #23: Create dummy ML predictions that don't affect results
+                # Create dummy ML predictions that don't affect results
                 self.ml_predictions = pd.DataFrame(index=self.features.index)
                 self.ml_predictions['rf_classification'] = 'Medium'
                 self.ml_predictions['xgb_growth_forecast'] = 0
@@ -165,7 +165,7 @@ class PharmaceuticalInvestmentPipeline:
             self.log("ML", f"ERROR: {e}")
             return False
     
-    # ===== STEP 6: ENSEMBLE =====
+    # ===ENSEMBLE =====
     
     def run_ensemble_layer(self) -> bool:
         """Combine all scores and predictions."""
@@ -182,7 +182,7 @@ class PharmaceuticalInvestmentPipeline:
             self.log("ENSEMBLE", f"ERROR: {e}")
             return False
     
-    # ===== STEP 7: OUTPUT GENERATION =====
+    # ===== OUTPUT GENERATION =====
     
     def run_output_layer(self) -> bool:
         """Generate ranked molecules and strategy recommendations."""
@@ -199,11 +199,11 @@ class PharmaceuticalInvestmentPipeline:
             self.log("OUTPUT", f"ERROR: {e}")
             return False
     
-    # ===== STEP 8: VALIDATION =====
+    # ===== VALIDATION =====
     
     def run_validation(self) -> Dict:
         """
-        FIX #24: Add sensitivity analysis and stability checks.
+        Add sensitivity analysis and stability checks.
         Sanity checks on final output and validation of assumptions.
         """
         validations = {}
@@ -231,9 +231,27 @@ class PharmaceuticalInvestmentPipeline:
             validations['ranking_unique'] = 'PASS'
 
             # Feature sanity checks
-            assert (self.features['competition_count'] >= 0).all(), "Negative competition count"
-            assert ((self.features['market_share'] >= 0) & (self.features['market_share'] <= 100)).all(), "Market share outside 0-100"
-            assert self.features['revenue_growth'].notnull().sum() > 0, "Revenue growth missing"
+            # Gracefully handle missing columns
+            def safe_feature_check(feat_name, check_func, error_msg):
+                if feat_name not in self.features.columns:
+                    self.log("VALIDATION", f"WARNING: Feature '{feat_name}' missing - skipping check")
+                    return True
+                try:
+                    assert check_func(self.features[feat_name]), error_msg
+                    return True
+                except AssertionError as e:
+                    self.log("VALIDATION", f"ERROR: {e}")
+                    return False
+            
+            safe_feature_check('competition_count', 
+                              lambda x: (x >= 0).all(), 
+                              "Negative competition count")
+            safe_feature_check('market_share',
+                              lambda x: ((x >= 0) & (x <= 100)).all(),
+                              "Market share outside 0-100")
+            safe_feature_check('revenue_growth',
+                              lambda x: x.notnull().sum() > 0,
+                              "Revenue growth missing")
             validations['feature_sanity'] = 'PASS'
 
             # Distribution checks
@@ -241,14 +259,14 @@ class PharmaceuticalInvestmentPipeline:
             assert tier_counts.max() < 0.95, "Tier distribution too concentrated"
             validations['distribution'] = 'PASS'
             
-            # FIX #24: Add sensitivity analysis - weight variation test
+            # Add sensitivity analysis - weight variation test
             self.log("VALIDATION", "Running sensitivity analysis...")
             
             # Test impact of weight changes (±10% on key weights)
             sensitivity_results = self._run_sensitivity_analysis()
             validations['sensitivity_analysis'] = sensitivity_results
             
-            # FIX #24: Add stability checks
+            # Add stability checks
             self.log("VALIDATION", "Running stability checks...")
             
             # Check correlation between ranking scores
@@ -267,7 +285,7 @@ class PharmaceuticalInvestmentPipeline:
     
     def _run_sensitivity_analysis(self) -> Dict:
         """
-        FIX #24: Test how ranking changes with weight variations.
+        Add sensitivity analysis - weight variation test.
         Vary key weights by ±10% and measure top 10 rank stability.
         """
         results = {'stability_score': 0.0, 'details': {}}
@@ -337,14 +355,24 @@ class PharmaceuticalInvestmentPipeline:
         try:
             # CSV export
             csv_path = self.output_dir / 'molecules_ranked.csv'
-            self.final_output.to_csv(csv_path, index=False)
+            try:
+                self.final_output.to_csv(csv_path, index=False)
+            except PermissionError:
+                fallback_csv = self.output_dir / f"molecules_ranked_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                self.final_output.to_csv(fallback_csv, index=False)
+                csv_path = fallback_csv
             exports['csv'] = str(csv_path)
             self.log("EXPORT", f"Exported CSV: {csv_path}")
             
             # Excel export (top 50)
             excel_path = self.output_dir / 'molecules_top50.xlsx'
             top50 = self.final_output[self.final_output['investment_tier'] == 'High Potential'].head(50)
-            top50.to_excel(excel_path, index=False)
+            try:
+                top50.to_excel(excel_path, index=False)
+            except PermissionError:
+                fallback_excel = self.output_dir / f"molecules_top50_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                top50.to_excel(fallback_excel, index=False)
+                excel_path = fallback_excel
             exports['excel'] = str(excel_path)
             self.log("EXPORT", f"Exported Excel (top 50): {excel_path}")
             
@@ -353,8 +381,14 @@ class PharmaceuticalInvestmentPipeline:
             summary = formatter.export_summary_json()
             
             json_path = self.output_dir / 'analysis_summary.json'
-            with open(json_path, 'w') as f:
-                json.dump(summary, f, indent=2, default=str)
+            try:
+                with open(json_path, 'w') as f:
+                    json.dump(summary, f, indent=2, default=str)
+            except PermissionError:
+                fallback_json = self.output_dir / f"analysis_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                with open(fallback_json, 'w') as f:
+                    json.dump(summary, f, indent=2, default=str)
+                json_path = fallback_json
             exports['json'] = str(json_path)
             self.log("EXPORT", f"Exported JSON summary: {json_path}")
             

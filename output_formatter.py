@@ -65,9 +65,10 @@ class OutputFormatter:
     
     # ===== CLASSIFICATION & RANKING =====
     
-    def classify_investment_tier(self) -> pd.Series:
+    def classify_investment_tier(self, ensemble_score: pd.Series = None) -> pd.Series:
         """Classify molecules into tiers based on ensemble score."""
-        ensemble_score = self.ensemble['ensemble_score']
+        if ensemble_score is None:
+            ensemble_score = self.ensemble['ensemble_score']
         
         # Use simple logic instead of pd.cut to avoid bin edge issues
         tiers = pd.Series('Moderate', index=ensemble_score.index)
@@ -97,18 +98,29 @@ class OutputFormatter:
     def extract_key_drivers(self, row: pd.Series) -> List[str]:
         """
         FIX #22: Add explainability - extract feature contributions to score.
+        FIX #9: Label as HEURISTIC drivers (rule-based, not ML-derived).
         Identify key drivers of score for each molecule using importance ranking.
         """
-        drivers = []
+        drivers = ['[Heuristic drivers]']  # FIX #9: Label as heuristic
         
-        rg = row.get('revenue_growth', 0)
-        ms = row.get('market_size', 0)
-        cc = row.get('competition_count', 0)
-        pc = row.get('price_change', 0)
-        ms_share = row.get('market_share', 0)
-        vol = row.get('volatility', 0)
-        opp_score = row.get('opportunity_score', 50)
-        risk_score = row.get('risk_score', 50)
+        # Safely coerce numeric values (avoid NaN formatting errors)
+        def num(x, default=0.0):
+            try:
+                v = float(x)
+                if np.isnan(v):
+                    return default
+                return v
+            except Exception:
+                return default
+
+        rg = num(row.get('revenue_growth', 0))
+        ms = num(row.get('market_size', 0))
+        cc = num(row.get('competition_count', 0))
+        pc = num(row.get('price_change', 0))
+        ms_share = num(row.get('market_share', 0))
+        vol = num(row.get('volatility', 0))
+        opp_score = num(row.get('opportunity_score', 50))
+        risk_score = num(row.get('risk_score', 50))
 
         # FIX #22: Calculate feature contributions (simple linear importance)
         # Features with highest absolute deviation from neutral contribute most
@@ -161,13 +173,22 @@ class OutputFormatter:
     def extract_risks(self, row: pd.Series) -> List[str]:
         """Identify key risks for each molecule."""
         risks = []
-        
-        ms_share = row.get('market_share', 0)
-        rg = row.get('revenue_growth', 0)
-        ms = row.get('market_size', 0)
-        vol = row.get('volatility', 0)
-        gex = row.get('generic_erosion_index', 100)
-        risk_score = row.get('risk_score', 0)
+        # Safely coerce numeric values
+        def num(x, default=0.0):
+            try:
+                v = float(x)
+                if np.isnan(v):
+                    return default
+                return v
+            except Exception:
+                return default
+
+        ms_share = num(row.get('market_share', 0))
+        rg = num(row.get('revenue_growth', 0))
+        ms = num(row.get('market_size', 0))
+        vol = num(row.get('volatility', 0))
+        gex = num(row.get('generic_erosion_index', 100))
+        risk_score = num(row.get('risk_score', 0))
 
         if ms_share > 80:
             risks.append(f"Monopoly concentration ({ms_share:.1f}% share) increases regulatory and pricing exposure")
@@ -270,7 +291,8 @@ class OutputFormatter:
         output['rank'] = ranked['rank']
         output['percentile'] = ranked['percentile']
         output['ensemble_score'] = ranked['ensemble_score']
-        output['investment_tier'] = self.classify_investment_tier()
+        # FIX: Pass ranked ensemble_score to avoid index mismatch
+        output['investment_tier'] = self.classify_investment_tier(ranked['ensemble_score'])
         
         # Core metrics
         output['molecule_id'] = ranked['molecule_id']
@@ -296,6 +318,12 @@ class OutputFormatter:
         output['volatility'] = output.index.map(
             lambda i: round(self.features.loc[i, 'volatility'] if i in self.features.index else 0, 3)
         )
+
+        # Structural flags
+        output['is_new_entry'] = output.index.map(lambda i: bool(self.features.loc[i, 'is_new_entry']) if ('is_new_entry' in self.features.columns and i in self.features.index) else False)
+        output['is_exit'] = output.index.map(lambda i: bool(self.features.loc[i, 'is_exit']) if ('is_exit' in self.features.columns and i in self.features.index) else False)
+        output['is_inactive'] = output.index.map(lambda i: bool(self.features.loc[i, 'is_inactive']) if ('is_inactive' in self.features.columns and i in self.features.index) else False)
+        output['has_partial_presence'] = output.index.map(lambda i: bool(self.features.loc[i, 'has_partial_presence']) if ('has_partial_presence' in self.features.columns and i in self.features.index) else False)
         
         # Risk & Opportunity
         output['opportunity_score'] = ranked['opportunity'].apply(lambda x: round(x, 1))

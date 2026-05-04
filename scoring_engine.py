@@ -12,6 +12,7 @@ from typing import Dict, Tuple
 try:
     from config import WEIGHTS
     from config import THRESHOLDS
+    from config import RISK_WEIGHTS
 except Exception:
     WEIGHTS = {
         'growth': 0.25,
@@ -25,6 +26,12 @@ except Exception:
         'small_market_size': 1.0,
         'decline_cagr_pct': -0.20
     }
+    RISK_WEIGHTS = {
+        'competition': 0.25,
+        'concentration': 0.25,
+        'volatility': 0.15,
+        'pricing': 0.15
+    }
 
 
 class ScoringEngine:
@@ -33,10 +40,10 @@ class ScoringEngine:
     Incorporates penalty mechanisms per Section 5.5.
     """
     
-    # ===== WEIGHTS (Section 5.3) =====
+    # ===== WEIGHTS  =====
     WEIGHTS = WEIGHTS
     
-    # ===== BUSINESS LOGIC CONSTRAINTS (Section 4) =====
+    # ===== BUSINESS LOGIC CONSTRAINTS  =====
     OPTIMAL_COMPETITION_MIN = 3
     OPTIMAL_COMPETITION_MAX = 15
     MONOPOLY_SHARE_THRESHOLD = 0.80  # > 80% = penalty
@@ -50,7 +57,7 @@ class ScoringEngine:
         self.scores = pd.DataFrame(index=features_df.index)
         self.penalties = {}
     
-    # ===== NORMALIZATION & SCALING (Section 5.4) =====
+    # ===== NORMALIZATION & SCALING  =====
     
     @staticmethod
     def log_scale(values: pd.Series, base: float = 10) -> pd.Series:
@@ -79,17 +86,17 @@ class ScoringEngine:
         penalty = np.where(hhi_norm > 0.25, np.exp(-2 * (hhi_norm - 0.25)), 1.0)
         return penalty
     
-    # ===== OPPORTUNITY SCORE (Section 5.1) =====
+    # ===== OPPORTUNITY SCORE =====
     
     def compute_growth_component(self) -> Tuple[pd.Series, Dict]:
         """
-        FIX #11: Use dataset-dependent midpoint instead of fixed 50.
+        Use dataset-dependent midpoint instead of fixed 50.
         Growth component: 25% weight.
         Uses S-curve to saturate extreme growth.
         """
         revenue_growth = self.features['revenue_growth']
         
-        # FIX #11: Calibrate midpoint to dataset median instead of fixed 50
+        # Use dataset-dependent midpoint instead of fixed 50
         median_growth = revenue_growth.median()
         
         # S-curve transformation: cap unrealistic growth
@@ -100,13 +107,27 @@ class ScoringEngine:
         growth_scaled[is_declining] *= 0.3
         
         # Normalize to 0-100
+        # Handle NaNs for structural cases: new entries -> allow high growth signal; inactive -> low
+        is_new = self.features.get('is_new_entry', pd.Series(False, index=self.features.index)).fillna(False)
+        is_inactive = self.features.get('is_inactive', pd.Series(False, index=self.features.index)).fillna(False)
+
+        # Set default for NaN scaled values
+        # For new entries, encourage higher scaled growth (e.g., 0.8) but confidence is reduced elsewhere
+        growth_scaled = growth_scaled.copy()
+        growth_scaled[pd.isna(growth_scaled) & is_new] = 0.8
+        # For inactive or explicit NaNs not new, set to 0
+        growth_scaled[pd.isna(growth_scaled)] = 0.0
+
+        # Inactive markets should have very low growth score
+        growth_scaled[is_inactive] = 0.0
+
         growth_score = growth_scaled * 100
         
         return growth_score, {'raw': revenue_growth, 'scaled': growth_scaled, 'midpoint_used': median_growth}
     
     def compute_market_size_component(self) -> Tuple[pd.Series, Dict]:
         """
-        FIX #12: Use min-max normalization instead of hardcoded division by 6.0.
+        Use min-max normalization instead of hardcoded division by 6.0.
         Market size component: 20% weight.
         Uses log scale (diminishing returns for huge markets).
         """
@@ -115,7 +136,7 @@ class ScoringEngine:
         # Log scale
         size_log = self.log_scale(market_size)
         
-        # FIX #12: Use min-max normalization instead of division by 6.0
+        # Use min-max normalization instead of division by 6.0
         log_min = size_log.min()
         log_max = size_log.max()
         log_range = log_max - log_min + 1e-10
@@ -160,7 +181,7 @@ class ScoringEngine:
         
         return opportunity
     
-    # ===== RISK SCORE (Section 5.1) =====
+    # ===== RISK SCORE =====
     
     def compute_competition_risk(self) -> Tuple[pd.Series, Dict]:
         """
@@ -243,7 +264,7 @@ class ScoringEngine:
     
     def compute_risk_score(self) -> pd.Series:
         """
-        FIX #10: Use config weights, not hardcoded 0.25 values.
+        Use config weights, not hardcoded 0.25 values.
         Risk Score = f(Competition 25%, Concentration 25%, Volatility 15%, Pricing 15%)
         """
         comp_risk, _ = self.compute_competition_risk()
@@ -251,13 +272,8 @@ class ScoringEngine:
         vol_risk, _ = self.compute_volatility_risk()
         price_risk, _ = self.compute_pricing_risk()
         
-        # FIX #10: Use config weights instead of hardcoded values
-        risk_weights = THRESHOLDS.get('risk_weights', {
-            'competition': 0.25,
-            'concentration': 0.25,
-            'volatility': 0.15,
-            'pricing': 0.15
-        })
+        # Use config weights instead of hardcoded values
+        risk_weights = RISK_WEIGHTS
         
         # Normalize weights to sum to 1
         total_weight = sum(risk_weights.values())
@@ -276,7 +292,7 @@ class ScoringEngine:
     
     def apply_penalties(self) -> pd.DataFrame:
         """
-        FIX #14: Normalize penalties to prevent stacking from distorting scores.
+        Use config thresholds to normalize penalties and prevent stacking from distorting scores.
         Apply penalty mechanisms:
         - Monopoly (> 80%) → heavy penalty
         - Declining revenue (< -20%) → negative adjustment
@@ -310,20 +326,37 @@ class ScoringEngine:
         erosion_score = (price_drop / (price_drop.max() + 1e-6)) * (vol_gain / (vol_gain.max() + 1e-6))
         penalties['generic_erosion_penalty'] = -10.0 * erosion_score
 
-        # FIX #14: Cap total penalty to prevent stacking distortion
+        # Use config thresholds to cap total penalty and prevent stacking distortion
         # Normalize by dividing by number of penalties (soft normalization)
         individual_penalties = penalties[[c for c in penalties.columns if 'penalty' in c]]
         penalties['total_penalty'] = individual_penalties.sum(axis=1)
         
-        # Cap total penalty to -50 (max 50 point deduction)
-        penalties['total_penalty'] = penalties['total_penalty'].clip(lower=-50)
+        # Additional structural penalties based on lifecycle flags
+        # Strong penalty for exits, small penalty for new entries and partial presence
+        is_exit = self.features.get('is_exit', pd.Series(False, index=self.features.index)).astype(bool)
+        is_new = self.features.get('is_new_entry', pd.Series(False, index=self.features.index)).astype(bool)
+        partial = self.features.get('has_partial_presence', pd.Series(False, index=self.features.index)).astype(bool)
+        is_inactive = self.features.get('is_inactive', pd.Series(False, index=self.features.index)).astype(bool)
+
+        # Define penalties (negative values)
+        penalties['exit_penalty'] = -80.0 * is_exit.astype(float)
+        penalties['new_entry_penalty'] = -10.0 * is_new.astype(float)
+        penalties['partial_presence_penalty'] = -10.0 * partial.astype(float)
+        # inactive handled as override in final scoring (force near-zero)
+        penalties['inactive_penalty'] = -100.0 * is_inactive.astype(float)
+
+        # Include exit/new/partial in total penalty sum but not inactive (override)
+        penalties['total_penalty'] = penalties['total_penalty'] + penalties['exit_penalty'] + penalties['new_entry_penalty'] + penalties['partial_presence_penalty']
+
+        # Cap total penalty to -100 (max deduction)
+        penalties['total_penalty'] = penalties['total_penalty'].clip(lower=-100)
 
         self.penalties = penalties
         return penalties
     
     def compute_final_score(self) -> pd.Series:
         """
-        FIX #13: Explicitly bound final score to [-100, 100].
+        Use config thresholds to explicitly bound final score to [-100, 100].
         Final Score = Opportunity - Risk + Penalties
         """
         opportunity = self.compute_opportunity_score()
@@ -339,20 +372,31 @@ class ScoringEngine:
         self.scores['penalties_raw'] = penalties['total_penalty']
         self.scores['final_raw'] = raw_final
 
-        # FIX #13: Explicit clipping to [-100, 100] range
+        # Use config thresholds to explicitly bound final score to [-100, 100]
         # Then rescale to 0-100 for output (where 50 = neutral)
         clipped = np.clip(raw_final, -100, 100)
-        
 
-            # FIX #25: Use config bounds instead of hardcoded values
-            score_min = THRESHOLDS.get('final_score_min', -100)
-            score_max = THRESHOLDS.get('final_score_max', 100)
-            clipped = np.clip(raw_final, score_min, score_max)
-        
-            # Rescale to [0, 100] (where 50 = 0 raw)
-            midpoint = (score_max - score_min) / 2
-            scaled = 50 + ((clipped - score_min - midpoint) / (score_max - score_min)) * 100
-            scaled = np.clip(scaled, 0, 100)
+        # Use config bounds instead of hardcoded values
+        score_min = THRESHOLDS.get('final_score_min', -100)
+        score_max = THRESHOLDS.get('final_score_max', 100)
+        clipped = np.clip(raw_final, score_min, score_max)
+
+        # Rescale to [0, 100] (where 50 = 0 raw)
+        midpoint = (score_max - score_min) / 2
+        scaled = 50 + ((clipped - score_min - midpoint) / (score_max - score_min)) * 100
+        scaled = np.clip(scaled, 0, 100)
+
+        # Override: For inactive molecules, force near-zero score
+        is_inactive = self.features.get('is_inactive', pd.Series(False, index=self.features.index)).astype(bool)
+        if is_inactive.any():
+            # set to very low score (1) to keep ranking but near-zero
+            scaled.loc[is_inactive] = 1.0
+
+        # For exits, ensure strong down-weight if not already low
+        is_exit = self.features.get('is_exit', pd.Series(False, index=self.features.index)).astype(bool)
+        if is_exit.any():
+            # reduce exit scores to 20% of original (but at least 1)
+            scaled.loc[is_exit] = (scaled.loc[is_exit] * 0.2).clip(lower=1.0)
         self.scores['final_score'] = scaled
         return scaled
     
@@ -373,7 +417,7 @@ class ScoringEngine:
         market_size_norm = self.features['market_size'] / (self.features['market_size'].max() + 1e-10)
         confidence -= (1 - market_size_norm) * 0.2
         
-        confidence = confidence.clip(0.3, 1.0)  # Min 30% confidence
+        confidence = confidence.clip(lower=0.3, upper=1.0)  # Min 30% confidence
         
         return confidence
     
@@ -400,6 +444,15 @@ class ScoringEngine:
         result['sector'] = self.features['sector']
         result['manufacturer'] = self.features['manufacturer']
         result['molecule'] = self.features['molecule']
+        # Expose structural flags for downstream layers
+        for flag in ['is_new_entry', 'is_exit', 'is_inactive', 'has_partial_presence', 'negative_revenue_flag', 'growth_anomaly_flag', 'imputed_flag']:
+            if flag in self.features.columns:
+                result[flag] = self.features[flag]
+            elif flag in self.scores.index and flag in self.scores.columns:
+                result[flag] = self.scores.get(flag)
+            else:
+                # default False if unavailable
+                result[flag] = False
         
         return result
 

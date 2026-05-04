@@ -73,182 +73,216 @@ class IQVIADataLoader:
     def clean(self) -> pd.DataFrame:
         """
         Clean data according to roadmap rules:
-        - Remove negative revenue/units (adjustment entries)
-        - Remove fully exited molecules
-        - Handle zero-base entries
-        - Impute missing values + flag
+        - Preserve original negative adjustments
+        - Treat NULL as structural zero (no imputation for revenue/volume)
+        - Add structural presence flags
+        - Compute growth/anomaly indicators
+        - Aggregate manufacturer rows to molecule-market level
         """
+        if self.raw_df is None:
+            raise RuntimeError("Call load() before clean()")
+
         df = self.raw_df.copy()
-        
-        # Create molecule identifier
+
+        # Create molecule identifier at manufacturer-row level (traceability)
         df['molecule_id'] = (
-            df['Manufacturer'] + '_' + 
-            df['Molecule List'] + '_' + 
-            df['Country']
+            df['Manufacturer'].astype(str) + '_' + 
+            df['Molecule List'].astype(str) + '_' + 
+            df['Country'].astype(str)
         )
-        
-        # ===== RULE 1: Negative revenue/units =====
-        # FIX #2: KEEP original negative values, DO NOT convert to NaN
-        # Create negative flag for later handling in scoring, not in cleaning
+
         revenue_cols = self.REVENUE_COLS
         volume_cols = self.VOLUME_COLS
 
+        # ===== RULE 1: Negative revenue/units =====
         has_negative = (df[revenue_cols] < 0).any(axis=1) | (df[volume_cols] < 0).any(axis=1)
-
         print(f"Rows with negative revenue/units: {has_negative.sum()}")
-        # preserve original values - DO NOT CONVERT NEGATIVES TO NAN
         for col in revenue_cols + volume_cols:
             raw_col = f"{col}_raw"
             if raw_col not in df.columns:
-                df[raw_col] = df[col]  # Keep originals intact
-
+                df[raw_col] = df[col]
         df['negative_revenue_flag'] = has_negative
-        # Original negative values are preserved; downstream scoring will handle with flag
-        
-        # ===== RULE 2: Fully exited molecules =====
-        # Molecule is fully exited if all revenue AND volume are null/zero across all periods
+
+        # ===== RULE 2: Fully exited molecules (manufacturer rows) =====
         revenue_filled = df[revenue_cols].fillna(0)
         volume_filled = df[volume_cols].fillna(0)
-
         is_exited = (revenue_filled.sum(axis=1) == 0) & (volume_filled.sum(axis=1) == 0)
-
-        print(f"Fully exited molecules: {is_exited.sum()}")
+        print(f"Fully exited molecules (manufacturer rows): {is_exited.sum()}")
         df['exited_flag'] = is_exited
-        # Keep exited rows but mark for downstream handling
-        
-        # ===== RULE 3: Handle missing values =====
-        # Impute missing revenue/volume robustly across time (row-wise interpolation across MAT columns)
-        # Preserve raw columns created above; create imputed flags for each cell
+
+        # ===== RULE 3: NULLs are structural -> convert to 0 (no imputation) =====
+        # FIX #8: Track which values were originally null before conversion
+        df['missing_flag'] = False
         for col in revenue_cols + volume_cols:
-            imputed_col = f"{col}_imputed"
-            df[imputed_col] = False
-
-        # FIX #3: Use median imputation per segment INSTEAD of interpolation
-        # (Pharma data is NOT linear, interpolation distorts trends)
-        # For remaining missing values after row-wise check, use segment median
+            df['missing_flag'] |= df[col].isna()
         
-        # For any fully-null rows (row still all NaN), fallback to segment median
-        segment_cols = ['Country', 'Sector', 'ATC1']
-        for col in revenue_cols + volume_cols:
-            missing_mask = df[col].isna()
-            if missing_mask.any():
-                seg_median = df.groupby(segment_cols)[col].transform('median')
-                df.loc[missing_mask, col] = seg_median[missing_mask]
-                df.loc[missing_mask, f"{col}_imputed"] = True
+        # Preserve raw columns above, then convert
+        df[revenue_cols] = df[revenue_cols].fillna(0)
+        df[volume_cols] = df[volume_cols].fillna(0)
+        
+        # Mark structural zeros (converted from NULL)
+        df['structural_zero_flag'] = df['missing_flag']
 
-        # Mark imputed at row-level if any MAT cell was imputed
-        df['imputed_flag'] = df[[f for f in df.columns if f.endswith('_imputed')]].any(axis=1)
+        # Maintain an imputed_flag for compatibility (no structural imputation applied)
+        df['imputed_flag'] = False
 
-        # Clean combined data_quality_flag to preserve previous flags
+        # Data quality flag base
         if 'data_quality_flag' in df.columns:
             df['data_quality_flag'] = df['data_quality_flag'].fillna('').astype(str)
         else:
             df['data_quality_flag'] = ''
 
-        # Append flags in a robust way
         neg_idx = df['negative_revenue_flag'] == True
         if neg_idx.any():
             df.loc[neg_idx, 'data_quality_flag'] = df.loc[neg_idx, 'data_quality_flag'].apply(lambda x: (';'.join([s for s in [x, 'NEGATIVE'] if s])).strip(';'))
 
-        imp_idx = df['imputed_flag'] == True
-        if imp_idx.any():
-            df.loc[imp_idx, 'data_quality_flag'] = df.loc[imp_idx, 'data_quality_flag'].apply(lambda x: (';'.join([s for s in [x, 'IMPUTED'] if s])).strip(';'))
-
         # ===== Growth anomaly detection & zero-base handling =====
-        # Compute simple CAGR between MAT Q2 2023 and MAT Q2 2025 (2-year interval)
-        start_col = self.REVENUE_COLS[0]
-        end_col = self.REVENUE_COLS[-1]
+        start_col = revenue_cols[0]
+        end_col = revenue_cols[-1]
         df['rev_start'] = df[start_col]
         df['rev_end'] = df[end_col]
-        # Zero-base detection: mark emerging if start <= 1
-        df['emerging_flag'] = df['rev_start'].fillna(0) <= 1
 
-        # Compute CAGR where possible; if base small, set NaN and mark emerging
-        def compute_cagr(row):
-            a = row['rev_start']
-            b = row['rev_end']
-            if pd.isna(a) or pd.isna(b):
-                return np.nan
-            if a <= 1:
-                return np.nan
-            years = 2.0
+        # Zero-base detection: emerging when start == 0
+        df['emerging_flag'] = df['rev_start'].fillna(0) == 0
+
+        def compute_cagr_row(a, b):
             try:
+                if pd.isna(a) or pd.isna(b):
+                    return np.nan
+                if a == 0:
+                    return np.nan
+                years = 2.0
                 return (b / a) ** (1.0 / years) - 1.0
             except Exception:
                 return np.nan
 
-        df['cagr_2y'] = df.apply(compute_cagr, axis=1)
+        df['cagr_2y'] = df.apply(lambda r: compute_cagr_row(r['rev_start'], r['rev_end']), axis=1)
 
-        # FIX #4: Add fallback when MAD is 0 (unstable anomaly detection)
         # Detect anomalies using sector-level median and MAD on cagr
         df['cagr_median_sector'] = df.groupby('Sector')['cagr_2y'].transform('median')
         df['cagr_mad'] = df.groupby('Sector')['cagr_2y'].transform(lambda x: np.median(np.abs(x - np.nanmedian(x))) if x.notna().any() else np.nan)
-        
-        # FIX #4: Use standard deviation as fallback when MAD == 0
         df['cagr_std'] = df.groupby('Sector')['cagr_2y'].transform('std')
-        
+
         def compute_z_score(row):
             mad = row['cagr_mad']
             std = row['cagr_std']
             cagr = row['cagr_2y']
             median = row['cagr_median_sector']
-            
             if pd.isna(cagr) or pd.isna(median):
                 return 0
-            
-            # Use MAD if available and non-zero, else use std
             if not pd.isna(mad) and mad > 1e-12:
                 return (cagr - median) / (1.4826 * mad)
             elif not pd.isna(std) and std > 1e-12:
                 return (cagr - median) / std
             else:
                 return 0
-        
+
         df['cagr_mad_z'] = df.apply(compute_z_score, axis=1)
         df['growth_anomaly_flag'] = df['cagr_mad_z'].abs() > 3
+
+        print(f"After cleaning: {len(df)} manufacturer rows remain")
+
+        # ===== STRUCTURAL PRESENCE FLAGS (manufacturer rows) =====
+        rev_later = df[revenue_cols[1:]]
+        df['is_new_entry'] = (df[revenue_cols[0]] == 0) & (rev_later.sum(axis=1) > 0)
+        df['is_exit'] = (df[revenue_cols[:-1]].sum(axis=1) > 0) & (df[revenue_cols[-1]] == 0)
+        df['is_inactive'] = (df[revenue_cols].sum(axis=1) == 0) & (df[volume_cols].sum(axis=1) == 0)
+        has_zero = (df[revenue_cols] == 0).any(axis=1)
+        has_pos = (df[revenue_cols] > 0).any(axis=1)
+        df['has_partial_presence'] = has_zero & has_pos & ~(df['is_new_entry'] | df['is_exit'])
+
+        # ===== PRE-AGGREGATION MARKET METRICS =====
+        # Compute manufacturer-level market share before aggregation.
+        # This uses molecule-level totals, not sector totals.
+        molecule_revenue = df.groupby(['Country', 'Molecule List'])['MAT Q2 2025_LCD MNF'].transform('sum')
+        df['market_share'] = (df['MAT Q2 2025_LCD MNF'] / (molecule_revenue + 1e-10)) * 100
+        df['market_share'] = df['market_share'].fillna(0).clip(0, 100)
+
+        # Competition count must also be computed before aggregation.
+        # After aggregation, Manufacturer becomes "Market" and would otherwise collapse to 1.
+        df['competition_count'] = df.groupby(['Country', 'Molecule List'])['Manufacturer'].transform('nunique').fillna(0)
+
+        # Pre-compute HHI at the molecule-country level from manufacturer shares.
+        # This is stored on every raw row and aggregated later with first().
+        share_frac = df['market_share'] / 100
+        df['hhi'] = share_frac.groupby([df['Country'], df['Molecule List']]).transform(lambda g: (g ** 2).sum() * 10000)
+        df['hhi'] = df['hhi'].fillna(2500)
+
+        # Group by Country + Molecule List (aggregate manufacturers within each market)
+        df = self._aggregate_to_molecule_market(df, revenue_cols, volume_cols)
+
+        print(f"After aggregation: {len(df)} molecule-market rows")
+
+        self.clean_df = df
+        return df
+    
+    def _aggregate_to_molecule_market(self, df: pd.DataFrame, revenue_cols: list, volume_cols: list) -> pd.DataFrame:
+        """
+         Aggregate manufacturer rows to molecule-market level (Country + Molecule List).
+         Compute market_share BEFORE aggregation, then take dominant player's share.
         
-        print(f"After cleaning: {len(df)} molecules remain")
+        Aggregation rules:
+        - Revenue/Volume: SUM across manufacturers
+        - Flags: OR (logical max)
+        - Market share: MAX across manufacturers (dominant player's share of sector)
+        - molecule_id: Create new ID = Molecule List_Country
+        """
         
-        # FIX #1: ADD MARKET-LEVEL AGGREGATION BEFORE RETURNING
-        # Aggregate by Country + Molecule (not manufacturer level)
-        # This ensures features are computed at molecule market level
-        revenue_cols_to_agg = self.REVENUE_COLS
-        volume_cols_to_agg = self.VOLUME_COLS
+        # Now aggregate by Country + Molecule List
+        groupby_cols = ['Country', 'Molecule List']
         
+        # Define aggregation functions
         agg_dict = {}
-        for col in revenue_cols_to_agg + volume_cols_to_agg:
-            agg_dict[col] = 'sum'  # Sum revenue/volume across manufacturers
-            if f"{col}_raw" in df.columns:
-                agg_dict[f"{col}_raw"] = 'first'
         
-        # Keep other important fields
-        for col in self.CLASS_COLS:
+        # Sum numeric columns (revenue, volume)
+        for col in revenue_cols + volume_cols:
+            agg_dict[col] = 'sum'
+        
+        # Boolean flags: take OR (max)
+        for flag_col in ['exited_flag', 'emerging_flag', 'growth_anomaly_flag', 
+                         'is_new_entry', 'is_exit', 'is_inactive', 'has_partial_presence',
+                         'negative_revenue_flag', 'missing_flag', 'structural_zero_flag', 'imputed_flag']:
+            if flag_col in df.columns:
+                agg_dict[flag_col] = 'max'  # OR logic: True if any manufacturer has it
+        
+        # Precomputed market metrics
+        if 'market_share' in df.columns:
+            agg_dict['market_share'] = 'max'
+        if 'competition_count' in df.columns:
+            agg_dict['competition_count'] = 'first'
+        if 'hhi' in df.columns:
+            agg_dict['hhi'] = 'first'
+        
+        # Sector: take first (should be same for molecule)
+        if 'Sector' in df.columns:
+            agg_dict['Sector'] = 'first'
+        
+        # ATC columns: take first
+        for col in ['ATC1', 'ATC2', 'ATC3', 'ATC4', 'Innovation Insights']:
             if col in df.columns:
                 agg_dict[col] = 'first'
         
-        agg_dict['Sector'] = 'first'
-        agg_dict['Country'] = 'first'
-        agg_dict['data_quality_flag'] = lambda x: ';'.join([s for s in x if s])
-        agg_dict['negative_revenue_flag'] = 'any'
-        agg_dict['imputed_flag'] = 'any'
-        agg_dict['exited_flag'] = 'all'
-        agg_dict['emerging_flag'] = 'any'
-        agg_dict['cagr_2y'] = 'mean'  # Average CAGR across manufacturers
-        agg_dict['growth_anomaly_flag'] = 'any'
-        agg_dict['cagr_median_sector'] = 'first'
-        agg_dict['cagr_std'] = 'first'
-        agg_dict['cagr_mad_z'] = 'mean'
+        # Confidence/quality: take max
+        for col in ['data_quality_flag', 'cagr_2y']:
+            if col in df.columns:
+                agg_dict[col] = 'first' if col == 'data_quality_flag' else 'mean'
         
-        # Aggregate at molecule-country level (market level)
-        df['molecule_id'] = df['Molecule List'] + '_' + df['Country']
-        df_agg = df.groupby(['Country', 'Molecule List'], as_index=False).agg(agg_dict)
-        df_agg['molecule_id'] = df_agg['Molecule List'] + '_' + df_agg['Country']
+        # Raw columns: preserve first (for traceability)
+        for col in df.columns:
+            if col.endswith('_raw') and col not in agg_dict:
+                agg_dict[col] = 'first'
         
-        print(f"After market-level aggregation: {len(df_agg)} molecules (from {len(df)} manufacturer rows)")
+        # Perform aggregation
+        agg_df = df.groupby(groupby_cols, as_index=False).agg(agg_dict)
         
-        self.clean_df = df_agg
-        return df_agg
-    
+        # Create new molecule_id at aggregated level
+        agg_df['molecule_id'] = agg_df['Molecule List'].astype(str) + '_' + agg_df['Country'].astype(str)
+        
+        # Keep Manufacturer column as 'Market' to indicate aggregation
+        agg_df['Manufacturer'] = 'Market'
+        
+        return agg_df
+
     def compute_quality_scores(self) -> Dict[str, DataQualityReport]:
         """
         Assign data confidence score per molecule (0.0 to 1.0).
@@ -269,7 +303,7 @@ class IQVIADataLoader:
             
             # ===== Count nulls =====
             null_count = mol_data[self.REVENUE_COLS + self.VOLUME_COLS].isnull().sum().sum()
-            report.null_count = null_count
+            report.null_count = int(null_count)
             
             # ===== Detect anomalies: extreme growth spikes =====
             revenue_vals = mol_data[self.REVENUE_COLS].values.flatten()
@@ -321,7 +355,7 @@ class IQVIADataLoader:
                 'max': self.clean_df[volume_cols].max().max(),
                 'mean': self.clean_df[volume_cols].mean().mean()
             },
-            'avg_confidence': np.mean([r.confidence_score for r in self.quality_report.values()])
+            'avg_confidence': np.mean([r.confidence_score for r in self.quality_report.values()]) if self.quality_report else None
         }
 
 

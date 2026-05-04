@@ -1,6 +1,5 @@
 """
 Feature Engineering: Transform IQVIA data into strategic metrics.
-Implements roadmap Section 3: Base (8) + Advanced (8) + Derived metrics.
 """
 
 import pandas as pd
@@ -8,6 +7,11 @@ import numpy as np
 from pathlib import Path
 from scipy import stats
 from typing import Dict, Tuple
+
+try:
+    from config import THRESHOLDS
+except ImportError:
+    THRESHOLDS = {}
 
 
 class FeatureEngineer:
@@ -35,27 +39,35 @@ class FeatureEngineer:
         self.features = pd.DataFrame()
         # Ensure molecule_id exists
         if 'molecule_id' not in self.df.columns:
-            self.df['molecule_id'] = (
-                self.df['Manufacturer'] + '_' + 
-                self.df['Molecule List'] + '_' + 
-                self.df['Country']
-            )
+            manufacturer = self.df['Manufacturer'] if 'Manufacturer' in self.df.columns else pd.Series('Unknown', index=self.df.index)
+            self.df['molecule_id'] = manufacturer.astype(str) + '_' + self.df['Molecule List'].astype(str) + '_' + self.df['Country'].astype(str)
     
-    # ===== BASE METRICS (Section 3.1) =====
+    # ===== BASE METRICS  =====
     
     def compute_revenue_growth(self) -> pd.Series:
         """YoY revenue growth %."""
         revenue = self.df[self.REVENUE_COLS]
-        # Growth from 2023 to 2025
-        growth = ((revenue.iloc[:, -1] - revenue.iloc[:, 0]) / (revenue.iloc[:, 0] + 1e-10)) * 100
-        growth = growth.replace([np.inf, -np.inf], 0).fillna(0)
-        return growth.clip(-100, 500)  # Cap at ±500% for outliers
+        # If base year is zero, we should not compute growth (emerging)
+        base = revenue.iloc[:, 0]
+        end = revenue.iloc[:, -1]
+        growth = pd.Series(index=self.df.index, dtype=float)
+        # Compute growth only where base > 0
+        mask = base > 0
+        growth.loc[mask] = ((end.loc[mask] - base.loc[mask]) / (base.loc[mask])) * 100
+        growth.loc[~mask] = np.nan
+        growth = growth.replace([np.inf, -np.inf], np.nan)
+        return growth.clip(-100, 500)
     
     def compute_volume_growth(self) -> pd.Series:
         """YoY volume growth %."""
         volume = self.df[self.VOLUME_COLS]
-        growth = ((volume.iloc[:, -1] - volume.iloc[:, 0]) / (volume.iloc[:, 0] + 1e-10)) * 100
-        growth = growth.replace([np.inf, -np.inf], 0).fillna(0)
+        base = volume.iloc[:, 0]
+        end = volume.iloc[:, -1]
+        growth = pd.Series(index=self.df.index, dtype=float)
+        mask = base > 0
+        growth.loc[mask] = ((end.loc[mask] - base.loc[mask]) / (base.loc[mask])) * 100
+        growth.loc[~mask] = np.nan
+        growth = growth.replace([np.inf, -np.inf], np.nan)
         return growth.clip(-100, 500)
     
     def compute_market_size(self) -> pd.Series:
@@ -67,18 +79,23 @@ class FeatureEngineer:
         """Number of competitors (unique manufacturers) offering the same molecule in the same country.
         This counts distinct manufacturers for each `Country` x `Molecule List` combination.
         """
+        if 'competition_count' in self.df.columns:
+            return self.df['competition_count'].fillna(0)
+
         comp_count = self.df.groupby(['Country', 'Molecule List'])['Manufacturer'].transform('nunique')
         return comp_count.fillna(0)
     
     def compute_market_share(self) -> pd.Series:
         """
-        FIX #5: Market share should be molecule's share of ITS OWN MARKET, not segment.
-        Denominator: Total revenue of that MOLECULE across all manufacturers (market-level).
-        After market aggregation, each row is already at molecule level, so divide by molecule total.
+        Use market_share from data_layer (computed before aggregation).
+        If data already aggregated, market_share = dominant manufacturer's share.
+        Only recompute if market_share column not provided by data_layer.
         """
-        # After data_layer aggregation, each row is a unique molecule per country
-        # Market share = (this row's revenue) / (total market for this molecule-country)
+        # If data_layer already provided market_share, use it
+        if 'market_share' in self.df.columns:
+            return self.df['market_share'].clip(0, 100).fillna(0)
         
+        # Fallback: recompute if not provided (shouldn't happen with fixed pipeline)
         # Group by Country + Molecule to get molecule-level totals
         molecule_totals = self.df.groupby(['Country', 'Molecule List'])['MAT Q2 2025_LCD MNF'].transform('sum')
         
@@ -86,11 +103,13 @@ class FeatureEngineer:
         molecule_rev = self.df['MAT Q2 2025_LCD MNF'].fillna(0)
         market_share = (molecule_rev / (molecule_totals + 1e-10)) * 100
         
+        # Clip to valid range [0, 100] to handle negative adjustments or rounding
+        market_share = market_share.clip(0, 100)
         return market_share.fillna(0)
     
     def compute_price_per_unit(self) -> pd.Series:
         """
-        FIX #7: Handle zero volume properly - set price = NaN when volume is 0.
+        Handle zero volume properly - set price = NaN when volume is 0.
         Don't use fillna(1) which creates fake prices.
         """
         revenue = self.df['MAT Q2 2025_LCD MNF'].fillna(0)
@@ -98,23 +117,29 @@ class FeatureEngineer:
         
         price_per_unit = revenue / (volume + 1e-10)
         
-        # FIX #7: Where volume is 0 or very small, set price to NaN (not a fake price)
+        # Where volume is 0 or very small, set price to NaN (not a fake price)
         price_per_unit = price_per_unit.where(volume > 0.1, np.nan)
         
         return price_per_unit.replace([np.inf, -np.inf], np.nan)
     
     def compute_price_change(self) -> pd.Series:
-        """Price trend: YoY price per unit change %."""
-        revenue_2023 = self.df['MAT Q2 2023_LCD MNF'].fillna(1)
-        volume_2023 = self.df['MAT Q2 2023_Standard Units'].fillna(1)
-        price_2023 = revenue_2023 / volume_2023
+        """Price trend: YoY price per unit change %.
+        FIX #4: Handle zero volume properly - set price = NaN when volume is 0.
+        """
+        revenue_2023 = self.df['MAT Q2 2023_LCD MNF'].fillna(0)
+        volume_2023 = self.df['MAT Q2 2023_Standard Units'].fillna(0)
         
-        revenue_2025 = self.df['MAT Q2 2025_LCD MNF'].fillna(1)
-        volume_2025 = self.df['MAT Q2 2025_Standard Units'].fillna(1)
-        price_2025 = revenue_2025 / volume_2025
+        # Where volume is zero, price is NaN (not fake 1)
+        price_2023 = revenue_2023 / (volume_2023 + 1e-10)
+        price_2023 = price_2023.where(volume_2023 > 0.1, np.nan)
+        
+        revenue_2025 = self.df['MAT Q2 2025_LCD MNF'].fillna(0)
+        volume_2025 = self.df['MAT Q2 2025_Standard Units'].fillna(0)
+        price_2025 = revenue_2025 / (volume_2025 + 1e-10)
+        price_2025 = price_2025.where(volume_2025 > 0.1, np.nan)
         
         price_change = ((price_2025 - price_2023) / (price_2023 + 1e-10)) * 100
-        price_change = price_change.replace([np.inf, -np.inf], 0).fillna(0)
+        price_change = price_change.replace([np.inf, -np.inf], np.nan).fillna(0)
         return price_change.clip(-100, 100)
     
     def compute_volatility(self) -> pd.Series:
@@ -131,40 +156,42 @@ class FeatureEngineer:
         volatility = yoy_df.std(axis=1).fillna(0)
         return volatility
     
-    # ===== ADVANCED METRICS (Section 3.2) =====
+    # ===== ADVANCED METRICS  =====
     
     def compute_hhi_market_concentration(self) -> pd.Series:
         """
-        FIX #6: HHI should be computed PER MOLECULE, not per segment.
-        Indicates market concentration within a molecule's market: > 2500 = highly concentrated.
+        Real HHI using market share (Herfindahl-Hirschman Index).
+        HHI = sum(market_share_i^2) for all competitors
+        > 2500 = highly concentrated, < 1500 = competitive
         """
-        # After market aggregation, each row is already a molecule.
-        # For concentration analysis, use revenue stability as proxy
+        if 'hhi' in self.df.columns:
+            return self.df['hhi'].fillna(2500)
+
+        # Get market shares at country-molecule level
+        market_share = self.compute_market_share()  # Returns 0-100 percentage
+        market_share_frac = market_share / 100  # Convert to fraction
         
-        revenue = self.df[self.REVENUE_COLS].fillna(0)
-        volume = self.df[self.VOLUME_COLS].fillna(0)
+        # Group by Country + Molecule, compute HHI as sum of squared shares
+        def compute_row_hhi(group):
+            return (group ** 2).sum() * 10000  # Scale to 0-10000 range
         
-        # Coefficient of variation as proxy for concentration
-        # High CV = unstable competition (potential for HHI shifts)
-        revenue_cv = (revenue.std(axis=1) / (revenue.mean(axis=1) + 1e-10)).fillna(0)
-        
-        # Convert to HHI-like scale (0-10000)
-        # Low CV = stable = low HHI risk = ~2500
-        # High CV = volatile = high HHI risk = ~7500
-        hhi_proxy = 2500 + (revenue_cv * 2000).clip(0, 7500)
-        
-        return hhi_proxy
+        hhi = market_share_frac.groupby([self.df['Country'], self.df['Molecule List']]).transform(lambda g: compute_row_hhi(g))
+        return hhi.fillna(2500)  # Default: moderate concentration
     
     def compute_cagr(self) -> pd.Series:
         """
         Compound Annual Growth Rate (2023-2025, 2 years).
         CAGR = (Ending / Beginning) ^ (1 / years) - 1
         """
-        revenue_start = self.df['MAT Q2 2023_LCD MNF'].fillna(1)
-        revenue_end = self.df['MAT Q2 2025_LCD MNF'].fillna(1)
-        
-        cagr = np.power(revenue_end / revenue_start, 1/2) - 1
-        cagr = cagr.replace([np.inf, -np.inf], 0).fillna(0)
+        revenue_start = self.df['MAT Q2 2023_LCD MNF']
+        revenue_end = self.df['MAT Q2 2025_LCD MNF']
+
+        # If start is zero, set CAGR to NaN (handled as emerging)
+        cagr = pd.Series(index=self.df.index, dtype=float)
+        mask = revenue_start > 0
+        cagr.loc[mask] = np.power(revenue_end.loc[mask] / revenue_start.loc[mask], 1/2) - 1
+        cagr.loc[~mask] = np.nan
+        cagr = cagr.replace([np.inf, -np.inf], np.nan)
         return cagr * 100  # Return as percentage
     
     def compute_revenue_sustainability_index(self) -> pd.Series:
@@ -219,7 +246,7 @@ class FeatureEngineer:
     
     def compute_channel_dependency(self) -> pd.Series:
         """
-        FIX #9: Channel dependency is a PROXY using Sector, which may not represent real channels.
+        Channel dependency is a PROXY using Sector, which may not represent real channels.
         
         ASSUMPTION: Sector (HOSPITAL/RETAIL) encodes distribution channel.
         If this is incorrect, this feature should be removed from scoring.
@@ -241,17 +268,17 @@ class FeatureEngineer:
         
         grp = rev.groupby(['Country', 'Molecule List', 'Sector'])[rev_col].transform('sum')
         total_by_mol = rev.groupby(['Country', 'Molecule List'])[rev_col].transform('sum') + 1e-10
-        
+
         channel_share = grp / total_by_mol
-        channel_dependency = rev.groupby(['Country', 'Molecule List'])['channel_share'].transform('max') if 'channel_share' in rev.columns else channel_share.max()
-        
+        channel_dependency = channel_share.groupby([rev['Country'], rev['Molecule List']]).transform('max')
+
         return channel_dependency.fillna(0.5)  # Neutral if no data
     
-    # ===== DERIVED METRICS (Section 3.3) =====
+    # ===== DERIVED METRICS =====
     
     def compute_lifecycle_stage(self) -> pd.Series:
         """
-        FIX #8: Use explicit, interpretable thresholds instead of rank-based bins.
+        Use explicit, interpretable thresholds instead of rank-based bins.
         Market Lifecycle Classification: Emerging / Growth / Mature / Declining.
         Based on: revenue growth + market size thresholds.
         """
@@ -259,36 +286,42 @@ class FeatureEngineer:
         revenue_growth = self.compute_revenue_growth()  # In %
         
         # Clean inputs
-        rg = revenue_growth.replace([np.inf, -np.inf], np.nan).fillna(0)
+        rg = revenue_growth.replace([np.inf, -np.inf], np.nan)
         ms = market_size.replace([np.inf, -np.inf], np.nan).fillna(0)
 
+        # Incorporate structural flags if available
+        is_new = self.df.get('is_new_entry', pd.Series(False, index=self.df.index))
+        is_exit = self.df.get('is_exit', pd.Series(False, index=self.df.index))
+        is_inactive = self.df.get('is_inactive', pd.Series(False, index=self.df.index))
+        # Use explicit thresholds for interpretability
+        # Use config thresholds instead of hardcoded values
+        emerging_growth = THRESHOLDS.get('lifecycle_emerging_growth', 0.20) * 100
+        growth_threshold = THRESHOLDS.get('lifecycle_growth_growth', 0.15) * 100
+        decline_threshold = THRESHOLDS.get('lifecycle_decline_threshold', -0.10) * 100
+        emerging_size = THRESHOLDS.get('lifecycle_emerging_market_size', 50)
+        mid_min = THRESHOLDS.get('lifecycle_mid_market_min', 50)
+        mid_max = THRESHOLDS.get('lifecycle_mid_market_max', 500)
 
-    # FIX #8: Use explicit thresholds for interpretability
-    # FIX #25: Use config thresholds instead of hardcoded values
-    from config import THRESHOLDS
-        
-    emerging_growth = THRESHOLDS.get('lifecycle_emerging_growth', 0.20) * 100
-    growth_threshold = THRESHOLDS.get('lifecycle_growth_growth', 0.15) * 100
-    decline_threshold = THRESHOLDS.get('lifecycle_decline_threshold', -0.10) * 100
-    emerging_size = THRESHOLDS.get('lifecycle_emerging_market_size', 50)
-    mid_min = THRESHOLDS.get('lifecycle_mid_market_min', 50)
-    mid_max = THRESHOLDS.get('lifecycle_mid_market_max', 500)
-        
-    stage = pd.Series('MATURE', index=self.df.index)
-        
-    # EMERGING: New markets with small size but positive growth
-    stage[(ms < emerging_size) & (rg > emerging_growth)] = 'EMERGING'
-        
-    # GROWTH: Mid-size markets with strong growth
-    stage[(ms >= mid_min) & (ms < mid_max) & (rg > growth_threshold)] = 'GROWTH'
-    stage[(ms >= mid_max) & (rg > emerging_growth)] = 'GROWTH'  # Large markets need higher growth
-        
-    # DECLINING: Negative growth regardless of size
-    stage[rg < decline_threshold] = 'DECLINING'
-        
-    # MATURE: Everything else (stable, mid-size or large)
-        
-    return stage
+        stage = pd.Series('MATURE', index=self.df.index)
+
+        # Exited and inactive overrides
+        stage[is_inactive] = 'EXITED'
+        stage[is_exit] = 'EXITED'
+
+        # EMERGING: New markets or structural zero-base with subsequent growth
+        stage[is_new] = 'EMERGING'
+        stage[(ms < emerging_size) & (rg > emerging_growth) & (~is_new) & (~is_exit)] = 'EMERGING'
+
+        # GROWTH: Mid/large markets with strong growth
+        stage[(~is_inactive) & (ms >= mid_min) & (ms < mid_max) & (rg > growth_threshold)] = 'GROWTH'
+        stage[(~is_inactive) & (ms >= mid_max) & (rg > emerging_growth)] = 'GROWTH'
+
+        # DECLINING: Negative growth and not exited
+        stage[(~is_inactive) & (rg < decline_threshold) & (~is_exit)] = 'DECLINING'
+
+        # MATURE: default
+
+        return stage
     
     def compute_risk_score(self) -> pd.Series:
         """
@@ -373,16 +406,36 @@ class FeatureEngineer:
         features['entry_barrier_score'] = self.compute_entry_barrier_score()
         
         # Add hierarchy info
-        features['molecule_id'] = self.df.get('molecule_id', 
-            self.df['Manufacturer'] + '_' + self.df['Molecule List'] + '_' + self.df['Country']
-        )
+        if 'molecule_id' in self.df.columns:
+            features['molecule_id'] = self.df['molecule_id']
+        else:
+            manufacturer = self.df['Manufacturer'] if 'Manufacturer' in self.df.columns else pd.Series('Unknown', index=self.df.index)
+            features['molecule_id'] = manufacturer.astype(str) + '_' + self.df['Molecule List'].astype(str) + '_' + self.df['Country'].astype(str)
         features['country'] = self.df['Country'].fillna('Unknown')
         features['sector'] = self.df['Sector'].fillna('Unknown')
-        features['manufacturer'] = self.df['Manufacturer'].fillna('Unknown')
+        features['manufacturer'] = self.df['Manufacturer'].fillna('Unknown') if 'Manufacturer' in self.df.columns else pd.Series('Unknown', index=self.df.index)
         features['molecule'] = self.df['Molecule List'].fillna('Unknown')
         
         self.features = features
+        
+        # Validate feature consistency
+        self._validate_feature_consistency()
         return features
+    
+    def _validate_feature_consistency(self):
+        """
+        Check that features are not dominated by zeros/NaNs.
+        Warn if any numeric feature has >70% zeros or NaNs.
+        """
+        numeric_features = self.features.select_dtypes(include=[np.number]).columns
+        
+        for feat in numeric_features:
+            non_null_count = self.features[feat].notna().sum()
+            zero_count = (self.features[feat] == 0).sum()
+            zero_pct = zero_count / len(self.features)
+            
+            if zero_pct > 0.70:
+                print(f"WARNING: Feature '{feat}' is {zero_pct*100:.1f}% zeros - may be uninformative")
 
 
 # Example usage
@@ -404,8 +457,3 @@ if __name__ == "__main__":
     print("\n=== Feature Statistics ===")
     print(features.describe())
 
-# FIX #25: Import config for thresholds
-try:
-    from config import THRESHOLDS
-except ImportError:
-    THRESHOLDS = {}
