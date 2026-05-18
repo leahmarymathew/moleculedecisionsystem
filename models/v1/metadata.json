@@ -1,0 +1,22 @@
+{
+  "trained_at": "2026-05-18T15:29:00.825198",
+  "data_path": "C:\\Users\\Leah\\Documents\\git\\analytics\\IQVIA - Leah .xlsx",
+  "n_samples": 19,
+  "models_dir": "C:\\Users\\Leah\\Documents\\git\\analytics\\models\\v1",
+  "rf": {
+    "holdout_accuracy": 0.75,
+    "n_estimators": 100,
+    "train_size": 15,
+    "test_size": 4
+  },
+  "xgboost": {
+    "available": false,
+    "test_score": null,
+    "test_rmse": null
+  },
+  "kmeans": {
+    "n_clusters": 3,
+    "silhouette_score": 0.9306881268045957,
+    "inertia": 8.999999999949579e+22
+  }
+}

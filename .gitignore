@@ -1,0 +1,49 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Source data — IQVIA workbooks are large and may contain sensitive commercial data
+*.xlsx
+*.xls
+
+# Pipeline outputs (regenerable)
+output/
+
+# Trained ML models — large binary files, regenerate with train_models.py
+models/**/*.joblib
+# Keep metadata.json so training provenance is tracked
+!models/**/metadata.json
+!models/**/feature_names.json
+
+# Logs
+*.log
+pipeline_run.log
+
+# Environment / secrets
+.env
+.env.*
+
+# Tool caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Build / packaging artefacts
+*.egg-info/
+dist/
+build/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+*.swp
+
+# Local Claude Code settings (user-specific)
+.claude/settings.local.json

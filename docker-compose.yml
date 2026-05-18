@@ -1,0 +1,65 @@
+services:
+
+  # ------------------------------------------------------------------
+  # FastAPI analytics pipeline
+  # ------------------------------------------------------------------
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      # Pre-trained models (run train_models.py on the host first)
+      - ./models:/app/models:ro
+      # Pipeline output written by main() CLI; not used by the API itself
+      - ./output:/app/output
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8000"
+      WORKERS: "1"        # >1 breaks the in-memory job store
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ------------------------------------------------------------------
+  # Prometheus — scrapes /metrics from the api service
+  # ------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+    restart: unless-stopped
+    depends_on:
+      - api
+
+  # ------------------------------------------------------------------
+  # Grafana — visualise Prometheus metrics
+  # Add the Prometheus datasource manually at http://localhost:3000
+  # (default credentials: admin / admin)
+  # ------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "admin"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus_data:
+  grafana_data:
